@@ -15,6 +15,8 @@ import json
 import math
 from collections import defaultdict
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -198,6 +200,121 @@ _lm_loaded = char_lm.load()
 if _lm_loaded:
     print("[predict] Character LM loaded for beam search rescoring")
 
+# ── Word segmentation ─────────────────────────────────────────────────────────
+def segment_words(pil_image):
+    """Segment a full-page image into individual word crops.
+
+    Strategy: detect text lines first via horizontal projection profile,
+    then split each line into words using vertical projection gaps.
+    This is much more robust than contour-based approaches on ruled paper.
+
+    Returns a list of PIL Image crops.
+    """
+    img = np.array(pil_image.convert("L"))  # grayscale
+    img_h, img_w = img.shape
+
+    # Binarize: Otsu threshold (works well for document images)
+    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Remove long horizontal lines (ruled notebook paper)
+    h_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (img_w // 3, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_line_kernel)
+    binary = cv2.subtract(binary, h_lines)
+
+    # Remove long vertical lines (margins)
+    v_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, img_h // 3))
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_line_kernel)
+    binary = cv2.subtract(binary, v_lines)
+
+    # Clean noise
+    binary = cv2.medianBlur(binary, 3)
+
+    # ── Step 1: Find text lines via horizontal projection ─────────────────
+    # Sum ink pixels per row
+    h_proj = binary.sum(axis=1) / 255
+
+    # Threshold: a row has text if it has more than 1% of width in ink
+    text_thresh = img_w * 0.01
+    line_regions = []
+    in_line = False
+    start = 0
+    for y in range(img_h):
+        if h_proj[y] > text_thresh and not in_line:
+            start = y
+            in_line = True
+        elif h_proj[y] <= text_thresh and in_line:
+            if y - start > img_h * 0.008:  # minimum line height
+                line_regions.append((start, y))
+            in_line = False
+    if in_line and img_h - start > img_h * 0.008:
+        line_regions.append((start, img_h))
+
+    if not line_regions:
+        return [pil_image]
+
+    # Merge lines that are very close (e.g. ascenders/descenders split a line)
+    merged_lines = [line_regions[0]]
+    for start, end in line_regions[1:]:
+        prev_start, prev_end = merged_lines[-1]
+        gap = start - prev_end
+        prev_height = prev_end - prev_start
+        if gap < prev_height * 0.3:
+            merged_lines[-1] = (prev_start, end)
+        else:
+            merged_lines.append((start, end))
+
+    # ── Step 2: Split each line into words via vertical projection ────────
+    crops = []
+    for line_y0, line_y1 in merged_lines:
+        # Add vertical padding
+        pad_y = max(2, int((line_y1 - line_y0) * 0.15))
+        ly0 = max(0, line_y0 - pad_y)
+        ly1 = min(img_h, line_y1 + pad_y)
+
+        line_strip = binary[line_y0:line_y1, :]
+        v_proj = line_strip.sum(axis=0) / 255
+
+        # Find word regions: contiguous columns with ink
+        word_thresh = (line_y1 - line_y0) * 0.02
+        word_regions = []
+        in_word = False
+        wx_start = 0
+        for x in range(img_w):
+            if v_proj[x] > word_thresh and not in_word:
+                wx_start = x
+                in_word = True
+            elif v_proj[x] <= word_thresh and in_word:
+                if x - wx_start > img_w * 0.008:  # minimum word width
+                    word_regions.append((wx_start, x))
+                in_word = False
+        if in_word and img_w - wx_start > img_w * 0.008:
+            word_regions.append((wx_start, img_w))
+
+        # Merge word segments that are very close (same word, thin gap)
+        if word_regions:
+            merged_words = [word_regions[0]]
+            line_height = line_y1 - line_y0
+            # Gap threshold: less than ~60% of average line height = same word
+            gap_thresh = line_height * 0.6
+            for wx0, wx1 in word_regions[1:]:
+                prev_x0, prev_x1 = merged_words[-1]
+                if wx0 - prev_x1 < gap_thresh:
+                    merged_words[-1] = (prev_x0, wx1)
+                else:
+                    merged_words.append((wx0, wx1))
+
+            for wx0, wx1 in merged_words:
+                pad_x = max(3, int((wx1 - wx0) * 0.05))
+                cx0 = max(0, wx0 - pad_x)
+                cx1 = min(img_w, wx1 + pad_x)
+                crop = pil_image.crop((cx0, ly0, cx1, ly1))
+                # Skip tiny crops that are likely noise
+                if crop.size[0] > 15 and crop.size[1] > 10:
+                    crops.append(crop)
+
+    return crops if crops else [pil_image]
+
+
 # ── TTA transforms ────────────────────────────────────────────────────────────
 # Light augmentations for test-time augmentation: slightly different perspectives
 # of the same image to reduce prediction variance.
@@ -247,6 +364,9 @@ _tta_transforms = [
 def predict_pil(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):
     """Run prediction on a PIL Image and return decoded text.
 
+    If the image is large (likely a full page), segment it into word crops
+    first and predict each one. Otherwise treat it as a single word crop.
+
     Args:
         pil_image: PIL Image to recognize.
         use_beam: If True, use beam search (more accurate). If False, greedy.
@@ -254,6 +374,25 @@ def predict_pil(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight
         use_tta: If True, run test-time augmentation (5 views, averaged logits).
         lm_weight: Weight for character LM rescoring in beam search.
     """
+    # Segment into word crops if the image is large enough to be a full page
+    w, h = pil_image.size
+    if w > 300 or h > 150:
+        crops = segment_words(pil_image)
+    else:
+        crops = [pil_image]
+
+    # Predict each crop and join
+    words = []
+    for crop in crops:
+        text = _predict_single(crop, use_beam, beam_width, use_tta, lm_weight)
+        if text.strip():
+            words.append(text.strip())
+
+    return " ".join(words) if words else ""
+
+
+def _predict_single(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):
+    """Predict a single word crop."""
     if use_tta:
         # Run inference on multiple augmented views, average the log-probs
         all_outputs = []
