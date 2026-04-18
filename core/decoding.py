@@ -115,6 +115,23 @@ def ctc_beam_decode(output, beam_width=10, lm_weight=0.0, lm=None):
     return "".join(IDX2CHAR.get(idx, "") for idx in best_text_indices)
 
 
+def ctc_beam_decode_batch(outputs, beam_width=5, lm_weight=0.0, lm=None):
+    """Batch wrapper around ctc_beam_decode for use in the validation loop.
+ 
+    Args:
+        outputs: (T, B, C) raw model logits.
+        beam_width: Number of hypotheses to keep at each step.
+        lm_weight: Weight for the language model score (0 = no LM).
+        lm: CharLM instance for rescoring (optional).
+    Returns:
+        List of decoded strings, one per sample in the batch.
+    """
+    results = []
+    for b in range(outputs.size(1)):
+        single = outputs[:, b:b+1, :]  # (T, 1, C)
+        results.append(ctc_beam_decode(single, beam_width=beam_width, lm_weight=lm_weight, lm=lm))
+    return results
+
 # ── Character-level language model ────────────────────────────────────────────
 
 class CharLM:

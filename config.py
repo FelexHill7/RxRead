@@ -37,12 +37,12 @@ OUTPUT_DIR = "outputs"
 PLOTS_DIR = os.path.join("web", "static", "plots")
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-BATCH_SIZE = 64
+BATCH_SIZE = 198
 EPOCHS = 80
 LR = 3e-4
 WEIGHT_DECAY = 1e-4
 PATIENCE = 10
-ACCUMULATION_STEPS = 2
+ACCUMULATION_STEPS = 1
 DROPOUT = 0.3
 GRAD_CLIP_NORM = 5
 BACKBONE_LR_MULT = 0.2
@@ -50,8 +50,8 @@ ONECYCLE_PCT_START = 0.1
 AUGMENT_START_EPOCH = 3
 
 # ── Performance tuning knobs ────────────────────────────────────────────────
-NUM_WORKERS = min(8, os.cpu_count() or 4)
-PREFETCH_FACTOR = 2
+NUM_WORKERS = 0
+PREFETCH_FACTOR = None
 
 # Evaluate CER on a subset for most epochs (faster), full set periodically.
 VAL_CER_SAMPLE_LIMIT = 2048

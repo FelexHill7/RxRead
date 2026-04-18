@@ -1,5 +1,5 @@
 """
-predict.py — Inference pipeline for the handwriting recogniser.
+inference.py — Inference pipeline for the handwriting recogniser.
 
 Loads the trained model once and exposes:
     - predict_pil(image)   — predict from a PIL Image (with TTA + LM rescoring)
@@ -44,6 +44,32 @@ if char_lm.load():
 
 # ── Word segmentation ─────────────────────────────────────────────────────────
 
+def _remove_ruled_lines(binary, img_w, img_h):
+    """Remove horizontal and vertical ruled lines without destroying handwriting.
+
+    Uses a narrow kernel so only true long straight lines are removed,
+    not handwriting strokes.
+    """
+    # Only remove lines that span at least 60% of the image width/height
+    # This avoids wiping out handwriting strokes
+    h_kernel_len = max(img_w // 5, 40)
+    v_kernel_len = max(img_h // 5, 40)
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel, iterations=1)
+
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel, iterations=1)
+
+    # Dilate detected lines slightly before subtracting to clean edges
+    h_lines = cv2.dilate(h_lines, np.ones((2, 1), np.uint8), iterations=1)
+    v_lines = cv2.dilate(v_lines, np.ones((1, 2), np.uint8), iterations=1)
+
+    cleaned = cv2.subtract(binary, h_lines)
+    cleaned = cv2.subtract(cleaned, v_lines)
+    return cleaned
+
+
 def _segment_words(pil_image):
     """Segment a full-page image into individual word crops.
 
@@ -54,37 +80,35 @@ def _segment_words(pil_image):
     img_h, img_w = img.shape
 
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Remove ruled lines
-    h_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (img_w // 3, 1))
-    binary = cv2.subtract(binary, cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_line_kernel))
-    v_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, img_h // 3))
-    binary = cv2.subtract(binary, cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_line_kernel))
     binary = cv2.medianBlur(binary, 3)
+
+    # Remove ruled lines safely
+    binary = _remove_ruled_lines(binary, img_w, img_h)
 
     # Step 1: Find text lines via horizontal projection
     h_proj = binary.sum(axis=1) / 255
-    text_thresh = img_w * 0.01
+    text_thresh = img_w * 0.005  # lowered from 0.01 — more sensitive
     line_regions = []
     in_line, start = False, 0
     for y in range(img_h):
         if h_proj[y] > text_thresh and not in_line:
             start, in_line = y, True
         elif h_proj[y] <= text_thresh and in_line:
-            if y - start > img_h * 0.008:
+            if y - start > img_h * 0.005:  # lowered min line height
                 line_regions.append((start, y))
             in_line = False
-    if in_line and img_h - start > img_h * 0.008:
+    if in_line and img_h - start > img_h * 0.005:
         line_regions.append((start, img_h))
 
     if not line_regions:
+        # Fallback: return the whole image as one crop
         return [pil_image]
 
     # Merge close lines
     merged_lines = [line_regions[0]]
     for start, end in line_regions[1:]:
         prev_start, prev_end = merged_lines[-1]
-        if start - prev_end < (prev_end - prev_start) * 0.3:
+        if start - prev_end < (prev_end - prev_start) * 0.5:
             merged_lines[-1] = (prev_start, end)
         else:
             merged_lines.append((start, end))
@@ -92,22 +116,22 @@ def _segment_words(pil_image):
     # Step 2: Split each line into words via vertical projection
     crops = []
     for line_y0, line_y1 in merged_lines:
-        pad_y = max(2, int((line_y1 - line_y0) * 0.15))
+        pad_y = max(2, int((line_y1 - line_y0) * 0.2))
         ly0 = max(0, line_y0 - pad_y)
         ly1 = min(img_h, line_y1 + pad_y)
 
         v_proj = binary[line_y0:line_y1, :].sum(axis=0) / 255
-        word_thresh = (line_y1 - line_y0) * 0.02
+        word_thresh = max(1, (line_y1 - line_y0) * 0.01)  # more sensitive
         word_regions = []
         in_word, wx_start = False, 0
         for x in range(img_w):
             if v_proj[x] > word_thresh and not in_word:
                 wx_start, in_word = x, True
             elif v_proj[x] <= word_thresh and in_word:
-                if x - wx_start > img_w * 0.008:
+                if x - wx_start > img_w * 0.005:
                     word_regions.append((wx_start, x))
                 in_word = False
-        if in_word and img_w - wx_start > img_w * 0.008:
+        if in_word and img_w - wx_start > img_w * 0.005:
             word_regions.append((wx_start, img_w))
 
         if word_regions:
@@ -124,7 +148,7 @@ def _segment_words(pil_image):
                 pad_x = max(3, int((wx1 - wx0) * 0.05))
                 cx0, cx1 = max(0, wx0 - pad_x), min(img_w, wx1 + pad_x)
                 crop = pil_image.crop((cx0, ly0, cx1, ly1))
-                if crop.size[0] > 15 and crop.size[1] > 10:
+                if crop.size[0] > 10 and crop.size[1] > 8:
                     crops.append(crop)
 
     return crops if crops else [pil_image]
@@ -174,5 +198,4 @@ def predict_pil(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight
 def predict_file(image_path, use_beam=True, beam_width=10):
     """Read an image from disk and return decoded text."""
     image = Image.open(image_path).convert("RGB")
-    return predict_pil(image, use_beam=use_beam, beam_width=beam_width)
     return predict_pil(image, use_beam=use_beam, beam_width=beam_width)

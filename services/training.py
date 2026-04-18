@@ -1,5 +1,5 @@
 """
-train.py — Training loop for the handwriting recogniser.
+training.py — Training loop for the handwriting recogniser.
 
 Orchestrates: data loading, model creation, training/validation epochs,
 checkpointing, and post-training evaluation. All domain logic is delegated
@@ -30,9 +30,10 @@ from config import (
 from core.model import ResNetCRNN
 from pipeline.dataset import GNHKDataset, build_dataset, collate_fn
 from pipeline.preprocessing import gpu_augment
-from core.decoding import ctc_greedy_decode_batch, CharLM
+from core.decoding import ctc_greedy_decode_batch, ctc_beam_decode_batch, CharLM
 from core.metrics import char_error_rate
 from services.evaluation import plot_training_curves, generate_confusion_matrix
+from torch.utils.data import WeightedRandomSampler
 
 
 def _collect_training_texts(dataset):
@@ -58,21 +59,25 @@ def train():
         torch.backends.cudnn.benchmark = True
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_set = build_dataset(TRAIN_DIR, synthetic_dir=SYNTHETIC_DIR, iam_dir=IAM_DIR)
-    val_set = GNHKDataset(TEST_DIR)
+    gnhk = GNHKDataset(TRAIN_DIR)
+    iam = IAMDataset(IAM_DIR) if IAM_DIR and os.path.isdir(IAM_DIR) else None
+    syn = SyntheticDataset(SYNTHETIC_DIR) if SYNTHETIC_DIR and os.path.isdir(SYNTHETIC_DIR) else None
+
+    datasets, weights = [gnhk], [3.0] * len(gnhk)
+    if iam and len(iam) > 0:
+        datasets.append(iam)
+        weights += [1.0] * len(iam)
+    if syn and len(syn) > 0:
+        datasets.append(syn)
+        weights += [2.0] * len(syn)  # synthetic is cleaner than IAM, weight middle
+
+    train_set = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
     print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
 
-    loader_kwargs = dict(
-        collate_fn=collate_fn,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-    )
-    if NUM_WORKERS > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    sampler = WeightedRandomSampler(weights, num_samples=len(train_set), replacement=True)
 
-    print(f"DataLoader workers: {NUM_WORKERS}")
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, **loader_kwargs)
+    # shuffle must be False when using a sampler
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=sampler, **loader_kwargs)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
 
     # ── Model & optimiser ─────────────────────────────────────────────────────
@@ -168,7 +173,7 @@ def train():
                 if cer_budget is not None and total_words >= cer_budget:
                     continue
 
-                decoded = ctc_greedy_decode_batch(outputs)
+                decoded = ctc_beam_decode_batch(outputs, beam_width=5)
                 for pred_text, gt_text in zip(decoded, ground_truths):
                     if cer_budget is not None and total_words >= cer_budget:
                         break
