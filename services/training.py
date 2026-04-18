@@ -28,12 +28,12 @@ from config import (
     VAL_CER_SAMPLE_LIMIT, FULL_VAL_INTERVAL, PLOT_EVERY_N_EPOCHS,
 )
 from core.model import ResNetCRNN
-from pipeline.dataset import GNHKDataset, build_dataset, collate_fn
+from pipeline.dataset import GNHKDataset, IAMDataset, SyntheticDataset, collate_fn
 from pipeline.preprocessing import gpu_augment
 from core.decoding import ctc_greedy_decode_batch, ctc_beam_decode_batch, CharLM
 from core.metrics import char_error_rate
 from services.evaluation import plot_training_curves, generate_confusion_matrix
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler, ConcatDataset
 
 
 def _collect_training_texts(dataset):
@@ -59,6 +59,7 @@ def train():
         torch.backends.cudnn.benchmark = True
 
     # ── Data ──────────────────────────────────────────────────────────────────
+    val_set = GNHKDataset(TEST_DIR)
     gnhk = GNHKDataset(TRAIN_DIR)
     iam = IAMDataset(IAM_DIR) if IAM_DIR and os.path.isdir(IAM_DIR) else None
     syn = SyntheticDataset(SYNTHETIC_DIR) if SYNTHETIC_DIR and os.path.isdir(SYNTHETIC_DIR) else None
@@ -75,6 +76,12 @@ def train():
     print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
 
     sampler = WeightedRandomSampler(weights, num_samples=len(train_set), replacement=True)
+
+    loader_kwargs = dict(
+    collate_fn=collate_fn,
+    num_workers=0,
+    pin_memory=(device.type == "cuda"),
+    )
 
     # shuffle must be False when using a sampler
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=sampler, **loader_kwargs)
