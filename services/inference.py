@@ -156,25 +156,42 @@ def _segment_words(pil_image):
 
 # ── Prediction functions ──────────────────────────────────────────────────────
 
+def _decode(output, use_beam, beam_width, lm_weight):
+    """Shared decoding wrapper for greedy vs beam search."""
+    if use_beam:
+        lm = char_lm if char_lm.loaded and lm_weight > 0 else None
+        return ctc_beam_decode(
+            output,
+            beam_width=beam_width,
+            lm_weight=lm_weight,
+            lm=lm
+        )
+    else:
+        return ctc_greedy_decode_single(output)
+    
+    
 def _predict_single(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):
-    """Predict a single word crop."""
     if use_tta:
         all_outputs = []
         for t in tta_transforms:
             tensor = t(pil_image).unsqueeze(0).to(device)
             with torch.no_grad():
                 out = model(tensor)
-            all_outputs.append(out.log_softmax(2))
-        output = torch.stack(all_outputs).mean(0)
+            all_outputs.append(out)
+        output = torch.stack(all_outputs, dim=0).mean(0)
     else:
         tensor = base_transform(pil_image).unsqueeze(0).to(device)
         with torch.no_grad():
             output = model(tensor)
 
-    if use_beam:
-        lm = char_lm if char_lm.loaded and lm_weight > 0 else None
-        return ctc_beam_decode(output, beam_width=beam_width, lm_weight=lm_weight, lm=lm)
-    return ctc_greedy_decode_single(output)
+    output = output[:, 0:1, :]  # enforce shape (T,1,C)
+
+    return _decode(
+        output,
+        use_beam=use_beam,
+        beam_width=beam_width,
+        lm_weight=lm_weight
+    )
 
 
 def predict_pil(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):

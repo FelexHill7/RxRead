@@ -33,15 +33,19 @@ Current branch is aligned with `origin/master` (no new local commits ahead of re
 
 This section summarizes the major method decisions made over time and the rationale behind each change.
 
-| Phase | Previous method | Current method | Why it changed |
-|------|------------------|----------------|----------------|
-| 1. Visual encoder | Custom shallow CNN feature extractor | ResNet-18 backbone in `ResNetCRNN` | Better transfer learning, stronger low-level features, and faster convergence on handwriting variability. |
-| 2. Sequence model | BiLSTM + CTC (baseline) | BiLSTM + Attention + CTC | Attention improved focus on informative timesteps while keeping CTC alignment-free training. |
-| 3. Decoding | Greedy CTC decode only | Beam search + optional char-LM rescoring (+ TTA at inference) | Better transcription quality and fewer implausible character sequences. |
-| 4. Data sources | GNHK only | GNHK + optional synthetic + optional IAM | Improve generalization and style diversity; reduce overfitting to one handwriting distribution. |
-| 5. Training strategy | Single LR, simpler scheduler, per-epoch full validation | AdamW, differential LR (backbone/head), OneCycleLR, sampled CER + periodic full CER | Faster training iterations with stable optimization and lower validation overhead. |
-| 6. Throughput | Slower data/validation loop | Multi-worker DataLoader, AMP on CUDA, grad accumulation, less frequent plotting | Reduce epoch wall-clock time without changing model quality targets. |
-| 7. Code organization | Flat file layout (`model.py`, `train.py`, etc.) | Layered structure: `core/`, `pipeline/`, `services/`, `web/`, `config.py` | Improve cohesion, reduce coupling, and make training/inference/web concerns easier to maintain. |
+## Method Evolution (Design Iterations)
+
+This section summarizes the major architectural and training decisions made during development.
+
+| Phase | Previous approach | Current approach | Rationale |
+|------|------------------|----------------|----------|
+| 1. Visual encoder | Custom CNN | ResNet-18 backbone | Improved feature extraction and transfer learning from ImageNet weights |
+| 2. Sequence modeling | CNN → BiLSTM | CNN → BiLSTM → Attention | Attention provides contextual refinement over sequential features |
+| 3. Decoding | Greedy CTC decoding | Beam search + character bigram LM | Improves stability and reduces implausible character sequences |
+| 4. Data sources | GNHK only | GNHK + IAM + synthetic | Improves robustness across handwriting styles |
+| 5. Optimization | Standard Adam | AdamW + differential LR + OneCycleLR | Better convergence and stability |
+| 6. Training efficiency | CPU-heavy pipeline | GPU augmentation + AMP + caching | Significant reduction in training time |
+| 7. Code structure | Monolithic scripts | Modular architecture (core/pipeline/services/web) | Separation of concerns and maintainability |
 
 ### Notes on CTC vs ResNet
 
@@ -61,8 +65,8 @@ Input Image (32×128, grayscale)
         │
         ▼
 ┌──────────────────────────┐
-│   ResNet-18 Backbone      │   conv1(1ch), stride tweaks in layer3/4
-│   + AdaptiveAvgPool2d     │   preserves sequence width for CTC
+│   ResNet-18 Backbone     │   conv1(1ch), stride tweaks in layer3/4
+│   (+ AdaptiveAvgPool2d ) │   preserves sequence width for CTC
 └──────────┬───────────────┘
            │  (B, T, 512)
            ▼

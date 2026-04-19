@@ -1,23 +1,37 @@
-# Core ML
+# ─────────────────────────────────────────────
+# CORE ML (CUDA 12.1 build)
+# ─────────────────────────────────────────────
 torch==2.2.2+cu121
 torchvision==0.17.2+cu121
 torchaudio==2.2.2+cu121
 
-# Data + processing
-numpy>=1.24
-opencv-python-headless>=4.8
-Pillow>=10.0
+# ─────────────────────────────────────────────
+# DATA + IMAGE PROCESSING
+# ─────────────────────────────────────────────
+numpy==1.26.4
+opencv-python>=4.8.0
+Pillow==10.3.0
+scipy==1.11.4
 
-# Training / evaluation
-matplotlib>=3.7
-scikit-learn>=1.3
+# ─────────────────────────────────────────────
+# TRAINING + EVALUATION
+# ─────────────────────────────────────────────
+matplotlib==3.8.2
+scikit-learn==1.4.0
+torchmetrics==1.3.0
 
-# App / utils
-flask>=3.0
-tqdm>=4.66
+# ─────────────────────────────────────────────
+# INFERENCE / APP
+# ─────────────────────────────────────────────
+flask==3.0.0
+tqdm==4.66.1
 
-# Optional (only if you actually use synthetic data)
-trdg>=1.8
+# ─────────────────────────────────────────────
+# OPTIONAL (synthetic data only)
+# ─────────────────────────────────────────────
+trdg==1.8.0
 
-# Fix broken dependency explicitly
-arabic-reshaper>=2.1.4
+# ─────────────────────────────────────────────
+# OCR / DECODING (optional upgrade if you extend beam search)
+# ─────────────────────────────────────────────
+pyctcdecode==0.5.0

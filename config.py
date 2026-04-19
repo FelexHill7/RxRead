@@ -38,8 +38,8 @@ PLOTS_DIR = os.path.join("web", "static", "plots")
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 BATCH_SIZE = 198
-EPOCHS = 80
-LR = 3e-4
+EPOCHS = 100
+LR = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 10
 ACCUMULATION_STEPS = 1
