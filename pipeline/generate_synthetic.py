@@ -74,7 +74,6 @@ def generate(count, output_dir):
 
     generator = GeneratorFromStrings(
         strings=words,
-        count=count,
         fonts=[],                    # empty = use trdg's built-in handwriting fonts
         language="en",
         size=64,                     # font size (will be resized to 32×128 by dataset)
@@ -82,10 +81,10 @@ def generate(count, output_dir):
         random_skew=True,
         blur=1,                      # slight blur
         random_blur=True,
-        distorsio_type=3,            # 3 = random distortion type
-        distorsio_orientation=2,     # 2 = both horizontal and vertical
+        distorsion_type=3,            # 3 = random distortion type
+        distorsion_orientation=2,     # 2 = both horizontal and vertical
         background_type=1,           # 1 = gaussian noise background
-        width=-1,                    # auto width based on text length
+        width=-128,                    # auto width based on text length
         alignment=1,                 # center
         text_color="#000000,#404040,#202020",  # dark ink variants
         is_handwritten=True,         # use handwriting-style rendering
