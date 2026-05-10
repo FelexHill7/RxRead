@@ -25,6 +25,11 @@ outputs/
 training_curves.png
 training_history.json
 
+# Local scratch / debug
+debug.py
+debug_outputs/
+cover_*.jpg
+
 # IDE / Editor
 .vscode/
 .idea/

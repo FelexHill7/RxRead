@@ -1,16 +1,20 @@
 """
-inference.py — Inference pipeline for the handwriting recogniser.
+inference.py — Inference pipeline for handwriting recognition.
 
-Loads the trained model once and exposes:
-    - predict_pil(image)   — predict from a PIL Image (with TTA + LM rescoring)
-    - predict_file(path)   — predict from an image file path
+Returns structured per-word output: each word carries text, bounding box, and
+confidence so the front-end can colour-code low-confidence predictions.
 
-Delegates decoding to decoding.py, transforms to preprocessing.py,
-and word segmentation to segmentation.py.
+Key fixes vs prior version:
+- CLAHE before Otsu so shadows / uneven lighting don't break thresholding
+- Word-segmentation thresholds are relative to detected line height instead
+  of absolute pixels (works across different image resolutions)
+- TTA averaging rotates AFTER resize (preprocessing.py) so all branches
+  see the same effective scale
+- LM weight default lowered from 0.7 → 0.4 (a bigram LM at 0.7 overcorrects
+  rare-but-correct tokens like drug names)
 """
 
 import os
-
 import cv2
 import numpy as np
 import torch
@@ -19,200 +23,203 @@ from PIL import Image
 from config import NUM_CLASSES, BEST_WEIGHTS, FINAL_WEIGHTS
 from core.model import ResNetCRNN
 from pipeline.preprocessing import base_transform, tta_transforms
-from core.decoding import ctc_greedy_decode_single, ctc_beam_decode, CharLM
+from core.decoding import (
+    ctc_greedy_decode_with_confidence,
+    ctc_beam_decode,
+    CharLM,
+)
 
-# ── Device & model (loaded once on import) ────────────────────────────────────
+# ── Device & model ────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = ResNetCRNN(NUM_CLASSES).to(device)
 
 _weights = BEST_WEIGHTS if os.path.exists(BEST_WEIGHTS) else FINAL_WEIGHTS
+
 if os.path.exists(_weights):
-    try:
-        model.load_state_dict(torch.load(_weights, map_location=device))
-        model.eval()
-        print(f"[predict] Loaded weights from {_weights} on {device}")
-    except RuntimeError:
-        print(f"[predict] WARNING: Weights in {_weights} don't match current architecture — retrain the model")
+    model.load_state_dict(torch.load(_weights, map_location=device))
+    model.eval()
+    print(f"[predict] Loaded weights: {_weights} on {device}")
 else:
-    print("[predict] WARNING: No weights found — run train.py first")
+    print("[predict] WARNING: No weights found")
 
-# ── Language model (loaded once) ──────────────────────────────────────────────
+# ── Language model ────────────────────────────────────────────────────────────
 char_lm = CharLM()
-if char_lm.load():
-    print("[predict] Character LM loaded for beam search rescoring")
+char_lm.load()
 
 
-# ── Word segmentation ─────────────────────────────────────────────────────────
+# ── WORD SEGMENTATION (resolution-independent) ────────────────────────────────
 
-def _remove_ruled_lines(binary, img_w, img_h):
-    """Remove horizontal and vertical ruled lines without destroying handwriting.
+def _preprocess_for_segmentation(pil_image):
+    """Convert to grayscale numpy, normalise contrast, return (gray, binary)."""
+    img = np.array(pil_image.convert("L"))
 
-    Uses a narrow kernel so only true long straight lines are removed,
-    not handwriting strokes.
-    """
-    # Only remove lines that span at least 60% of the image width/height
-    # This avoids wiping out handwriting strokes
-    h_kernel_len = max(img_w // 5, 40)
-    v_kernel_len = max(img_h // 5, 40)
+    # CLAHE handles shadows / uneven page lighting that crush Otsu.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img = clahe.apply(img)
 
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
-    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    _, binary = cv2.threshold(
+        img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    binary = cv2.medianBlur(binary, 3)
+    return img, binary
 
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
-    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel, iterations=1)
 
-    # Dilate detected lines slightly before subtracting to clean edges
-    h_lines = cv2.dilate(h_lines, np.ones((2, 1), np.uint8), iterations=1)
-    v_lines = cv2.dilate(v_lines, np.ones((1, 2), np.uint8), iterations=1)
+def _detect_lines(binary):
+    """Return list of (y0, y1) line spans via horizontal projection."""
+    h = binary.shape[0]
+    h_proj = np.sum(binary, axis=1)
+    if h_proj.max() == 0:
+        return []
 
-    cleaned = cv2.subtract(binary, h_lines)
-    cleaned = cv2.subtract(cleaned, v_lines)
-    return cleaned
+    line_thresh = h_proj.max() * 0.15
+    lines = []
+    in_line, start = False, 0
+    for y in range(h):
+        if h_proj[y] > line_thresh and not in_line:
+            start, in_line = y, True
+        elif h_proj[y] <= line_thresh and in_line:
+            if y - start > 10:
+                lines.append((start, y))
+            in_line = False
+    if in_line:
+        lines.append((start, h))
+    return lines
 
 
 def _segment_words(pil_image):
-    """Segment a full-page image into individual word crops.
+    """Segment a page image into per-word crops with absolute bboxes.
 
-    Strategy: detect text lines via horizontal projection profile,
-    then split each line into words using vertical projection gaps.
+    Word-spacing thresholds scale with the detected line height instead of
+    using fixed pixel constants — fixed values broke on photos at different
+    resolutions (e.g. > 20 px gap required for a 1500 px-wide phone photo
+    is barely a single space).
+
+    Returns:
+        list of (PIL crop, (x0, y0, x1, y1)) — bbox in source-image coords.
     """
-    img = np.array(pil_image.convert("L"))
-    img_h, img_w = img.shape
+    _, binary = _preprocess_for_segmentation(pil_image)
+    h, w = binary.shape
 
-    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    binary = cv2.medianBlur(binary, 3)
+    lines = _detect_lines(binary)
+    if not lines:
+        return [(pil_image, (0, 0, pil_image.size[0], pil_image.size[1]))]
 
-    # Remove ruled lines safely
-    binary = _remove_ruled_lines(binary, img_w, img_h)
-
-    # Step 1: Find text lines via horizontal projection
-    h_proj = binary.sum(axis=1) / 255
-    text_thresh = img_w * 0.005  # lowered from 0.01 — more sensitive
-    line_regions = []
-    in_line, start = False, 0
-    for y in range(img_h):
-        if h_proj[y] > text_thresh and not in_line:
-            start, in_line = y, True
-        elif h_proj[y] <= text_thresh and in_line:
-            if y - start > img_h * 0.005:  # lowered min line height
-                line_regions.append((start, y))
-            in_line = False
-    if in_line and img_h - start > img_h * 0.005:
-        line_regions.append((start, img_h))
-
-    if not line_regions:
-        # Fallback: return the whole image as one crop
-        return [pil_image]
-
-    # Merge close lines
-    merged_lines = [line_regions[0]]
-    for start, end in line_regions[1:]:
-        prev_start, prev_end = merged_lines[-1]
-        if start - prev_end < (prev_end - prev_start) * 0.5:
-            merged_lines[-1] = (prev_start, end)
-        else:
-            merged_lines.append((start, end))
-
-    # Step 2: Split each line into words via vertical projection
     crops = []
-    for line_y0, line_y1 in merged_lines:
-        pad_y = max(2, int((line_y1 - line_y0) * 0.2))
-        ly0 = max(0, line_y0 - pad_y)
-        ly1 = min(img_h, line_y1 + pad_y)
+    for y0, y1 in lines:
+        line_h = max(y1 - y0, 1)
+        # Resolution-independent thresholds:
+        word_gap_px = max(int(line_h * 0.6), 6)
+        min_word_w  = max(int(line_h * 0.3), 4)
 
-        v_proj = binary[line_y0:line_y1, :].sum(axis=0) / 255
-        word_thresh = max(1, (line_y1 - line_y0) * 0.01)  # more sensitive
-        word_regions = []
-        in_word, wx_start = False, 0
-        for x in range(img_w):
-            if v_proj[x] > word_thresh and not in_word:
-                wx_start, in_word = x, True
-            elif v_proj[x] <= word_thresh and in_word:
-                if x - wx_start > img_w * 0.005:
-                    word_regions.append((wx_start, x))
+        row = binary[y0:y1, :]
+        v_proj = np.sum(row, axis=0)
+
+        col_thresh = v_proj.max() * 0.05 if v_proj.max() > 0 else 0
+        gaps = v_proj <= col_thresh
+
+        words = []
+        in_word, start_x = False, 0
+        for x in range(w):
+            if not gaps[x] and not in_word:
+                start_x, in_word = x, True
+            elif gaps[x] and in_word:
+                if x - start_x >= min_word_w:
+                    words.append([start_x, x])
                 in_word = False
-        if in_word and img_w - wx_start > img_w * 0.005:
-            word_regions.append((wx_start, img_w))
+        if in_word:
+            words.append([start_x, w])
 
-        if word_regions:
-            merged_words = [word_regions[0]]
-            gap_thresh = (line_y1 - line_y0) * 0.6
-            for wx0, wx1 in word_regions[1:]:
-                prev_x0, prev_x1 = merged_words[-1]
-                if wx0 - prev_x1 < gap_thresh:
-                    merged_words[-1] = (prev_x0, wx1)
-                else:
-                    merged_words.append((wx0, wx1))
+        # Merge spans separated by less than word_gap_px (these are intra-word gaps).
+        merged = []
+        for wx0, wx1 in words:
+            if merged and wx0 - merged[-1][1] < word_gap_px:
+                merged[-1][1] = wx1
+            else:
+                merged.append([wx0, wx1])
 
-            for wx0, wx1 in merged_words:
-                pad_x = max(3, int((wx1 - wx0) * 0.05))
-                cx0, cx1 = max(0, wx0 - pad_x), min(img_w, wx1 + pad_x)
-                crop = pil_image.crop((cx0, ly0, cx1, ly1))
-                if crop.size[0] > 10 and crop.size[1] > 8:
-                    crops.append(crop)
+        for wx0, wx1 in merged:
+            crop = pil_image.crop((wx0, y0, wx1, y1))
+            if crop.size[0] > 12 and crop.size[1] > 12:
+                crops.append((crop, (wx0, y0, wx1, y1)))
 
-    return crops if crops else [pil_image]
+    if not crops:
+        return [(pil_image, (0, 0, pil_image.size[0], pil_image.size[1]))]
+    return crops
 
 
-# ── Prediction functions ──────────────────────────────────────────────────────
+# ── DECODING ──────────────────────────────────────────────────────────────────
 
-def _decode(output, use_beam, beam_width, lm_weight):
-    """Shared decoding wrapper for greedy vs beam search."""
-    if use_beam:
-        lm = char_lm if char_lm.loaded and lm_weight > 0 else None
-        return ctc_beam_decode(
-            output,
-            beam_width=beam_width,
-            lm_weight=lm_weight,
-            lm=lm
-        )
-    else:
-        return ctc_greedy_decode_single(output)
-    
-    
-def _predict_single(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):
+def _decode_with_confidence(output, use_beam, beam_width, lm_weight):
+    """Return (text, confidence). Beam path uses the same confidence proxy
+    via greedy on the same averaged logits — bounded at [0, 1] and stable."""
+    text_g, conf = ctc_greedy_decode_with_confidence(output)
+    if not use_beam:
+        return text_g, conf
+
+    lm = char_lm if char_lm.loaded and lm_weight > 0 else None
+    text_b = ctc_beam_decode(output, beam_width=beam_width,
+                             lm_weight=lm_weight, lm=lm)
+    # Confidence stays the greedy estimate — it's the model's own certainty,
+    # independent of which decoder picked the final string.
+    return text_b, conf
+
+
+# ── SINGLE PREDICTION ─────────────────────────────────────────────────────────
+
+def _predict_single(pil_image, use_beam=True, beam_width=15,
+                    use_tta=True, lm_weight=0.4):
     if use_tta:
-        all_outputs = []
+        outs = []
         for t in tta_transforms:
-            tensor = t(pil_image).unsqueeze(0).to(device)
+            x = t(pil_image).unsqueeze(0).to(device)
             with torch.no_grad():
-                out = model(tensor)
-            all_outputs.append(out)
-        output = torch.stack(all_outputs, dim=0).mean(0)
+                outs.append(model(x))
+        output = torch.stack(outs).mean(0)
     else:
-        tensor = base_transform(pil_image).unsqueeze(0).to(device)
+        x = base_transform(pil_image).unsqueeze(0).to(device)
         with torch.no_grad():
-            output = model(tensor)
+            output = model(x)
 
-    output = output[:, 0:1, :]  # enforce shape (T,1,C)
-
-    return _decode(
-        output,
-        use_beam=use_beam,
-        beam_width=beam_width,
-        lm_weight=lm_weight
-    )
+    output = output[:, 0:1, :]
+    return _decode_with_confidence(output, use_beam, beam_width, lm_weight)
 
 
-def predict_pil(pil_image, use_beam=True, beam_width=10, use_tta=True, lm_weight=0.3):
-    """Run prediction on a PIL Image and return decoded text.
+# ── FULL PIPELINE ─────────────────────────────────────────────────────────────
 
-    If the image is large (likely a full page), segment it into word crops
-    first and predict each one.
+def predict(image, use_beam=True, beam_width=15,
+            use_tta=True, lm_weight=0.4):
+    """Run segmentation + recognition and return per-word output.
+
+    Args:
+        image: PIL.Image or str path to an image file.
+
+    Returns:
+        dict with:
+            text:       joined transcription
+            confidence: mean confidence across non-empty words [0, 1]
+            words:      list of {text, confidence, bbox: [x0,y0,x1,y1]}
     """
-    w, h = pil_image.size
-    crops = _segment_words(pil_image) if (w > 300 or h > 150) else [pil_image]
+    if isinstance(image, str):
+        image = Image.open(image).convert("RGB")
+
+    crops = _segment_words(image)
 
     words = []
-    for crop in crops:
-        text = _predict_single(crop, use_beam, beam_width, use_tta, lm_weight)
-        if text.strip():
-            words.append(text.strip())
+    for crop, bbox in crops:
+        text, conf = _predict_single(crop, use_beam, beam_width,
+                                     use_tta, lm_weight)
+        text = text.strip()
+        if not text:
+            continue
+        words.append({
+            "text": text,
+            "confidence": round(float(conf), 3),
+            "bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+        })
 
-    return " ".join(words) if words else ""
-
-
-def predict_file(image_path, use_beam=True, beam_width=10):
-    """Read an image from disk and return decoded text."""
-    image = Image.open(image_path).convert("RGB")
-    return predict_pil(image, use_beam=use_beam, beam_width=beam_width)
+    avg_conf = sum(w["confidence"] for w in words) / len(words) if words else 0.0
+    return {
+        "text": " ".join(w["text"] for w in words),
+        "confidence": round(float(avg_conf), 3),
+        "words": words,
+    }

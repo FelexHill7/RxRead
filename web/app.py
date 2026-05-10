@@ -25,7 +25,7 @@ os.chdir(_project_root)
 from flask import Flask, request, jsonify, render_template
 from PIL import Image
 
-from services.inference import predict_pil
+from services.inference import predict
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 _web_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,8 +54,7 @@ def predict():
 
     try:
         image = Image.open(io.BytesIO(file.read())).convert("RGB")
-        text = predict_pil(image)
-        return jsonify({"text": text})
+        return jsonify(predict(image))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

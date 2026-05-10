@@ -208,6 +208,34 @@
     animation: fadeUp 0.4s ease forwards;
   }
 
+  /* Per-word confidence colouring — high = ink, mid = amber, low = red */
+  .result-text .word        { display: inline-block; margin-right: 0.35em; cursor: help; }
+  .result-text .word.high   { color: var(--ink); }
+  .result-text .word.mid    { color: #c98a2b; border-bottom: 1.5px dotted #c98a2b; }
+  .result-text .word.low    { color: var(--red);  border-bottom: 1.5px dotted var(--red); }
+
+  .word-legend {
+    margin-top: 14px;
+    font-size: 0.65rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.45;
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  .word-legend span::before {
+    content: '';
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .word-legend .lg-high::before { background: var(--ink); }
+  .word-legend .lg-mid::before  { background: #c98a2b; }
+  .word-legend .lg-low::before  { background: var(--red); }
+
   @keyframes fadeUp {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0);   }
@@ -308,8 +336,14 @@
     <p class="result-label">Transcription</p>
     <p class="result-text" id="result-text"></p>
 
+    <div class="word-legend" id="word-legend" style="display:none">
+      <span class="lg-high">High confidence</span>
+      <span class="lg-mid">Uncertain</span>
+      <span class="lg-low">Low confidence</span>
+    </div>
+
     <div class="confidence-bar-wrap" id="conf-wrap" style="display:none">
-      <p class="confidence-label">Model confidence</p>
+      <p class="confidence-label">Overall model confidence</p>
       <div class="confidence-track">
         <div class="confidence-fill" id="conf-fill"></div>
       </div>
@@ -334,7 +368,29 @@
   const resultText = document.getElementById('result-text');
   const confWrap   = document.getElementById('conf-wrap');
   const confFill   = document.getElementById('conf-fill');
+  const wordLegend = document.getElementById('word-legend');
   const resetLink  = document.getElementById('reset-link');
+
+  function escapeHTML(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+
+  function confidenceClass(c) {
+    if (c >= 0.85) return 'high';
+    if (c >= 0.60) return 'mid';
+    return 'low';
+  }
+
+  function renderWords(words) {
+    if (!words || !words.length) return '(no text detected)';
+    return words.map(w => {
+      const cls = confidenceClass(w.confidence);
+      const pct = (w.confidence * 100).toFixed(0);
+      return `<span class="word ${cls}" title="confidence: ${pct}%">${escapeHTML(w.text)}</span>`;
+    }).join('');
+  }
 
   let selectedFile = null;
 
@@ -385,8 +441,15 @@
         resultText.textContent = data.error;
         resultText.classList.add('result-error');
         confWrap.style.display = 'none';
+        wordLegend.style.display = 'none';
       } else {
-        resultText.textContent = data.text || '(no text detected)';
+        if (data.words && data.words.length) {
+          resultText.innerHTML = renderWords(data.words);
+          wordLegend.style.display = 'flex';
+        } else {
+          resultText.textContent = data.text || '(no text detected)';
+          wordLegend.style.display = 'none';
+        }
         if (data.confidence !== undefined) {
           confFill.style.width = (data.confidence * 100).toFixed(1) + '%';
           confWrap.style.display = 'block';

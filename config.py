@@ -18,12 +18,11 @@ NUM_CLASSES = len(CHARS) + 1  # +1 for CTC blank
 
 # ── Image dimensions ──────────────────────────────────────────────────────────
 IMG_HEIGHT = 32
-IMG_WIDTH = 128
+IMG_WIDTH = 320
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 TRAIN_DIR = "data/gnhk/train_data"
 TEST_DIR = "data/gnhk/test_data"
-SYNTHETIC_DIR = "data/synthetic"
 IAM_DIR = "data/iam"
 
 # ── Checkpoint paths ──────────────────────────────────────────────────────────
@@ -37,25 +36,24 @@ OUTPUT_DIR = "outputs"
 PLOTS_DIR = os.path.join("web", "static", "plots")
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-BATCH_SIZE = 198
+BATCH_SIZE = 256
 EPOCHS = 100
-LR = 1e-3
-WEIGHT_DECAY = 1e-4
-PATIENCE = 10
+LR = 2e-4
+WEIGHT_DECAY = 3e-4
+PATIENCE = 6
 ACCUMULATION_STEPS = 1
-DROPOUT = 0.3
+DROPOUT = 0.45
 GRAD_CLIP_NORM = 5
 BACKBONE_LR_MULT = 0.2
 ONECYCLE_PCT_START = 0.1
-AUGMENT_START_EPOCH = 3
 
 # ── Performance tuning knobs ────────────────────────────────────────────────
-NUM_WORKERS = 0
+NUM_WORKERS = 0  # Set to 0 for Windows compatibility; can be >0 on Linux/Mac for faster data loading.
 PREFETCH_FACTOR = None
 
 # Evaluate CER on a subset for most epochs (faster), full set periodically.
-VAL_CER_SAMPLE_LIMIT = 2048
-FULL_VAL_INTERVAL = 5
+VAL_CER_SAMPLE_LIMIT = 8192
+FULL_VAL_INTERVAL = 10
 
 # Plot less frequently to avoid per-epoch matplotlib overhead.
 PLOT_EVERY_N_EPOCHS = 5

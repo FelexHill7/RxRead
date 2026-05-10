@@ -1,9 +1,9 @@
 """
 training.py — Training loop for the handwriting recogniser.
 
-Orchestrates: data loading, model creation, training/validation epochs,
-checkpointing, and post-training evaluation. All domain logic is delegated
-to focused modules.
+Orchestrates data loading, model creation, training/validation epochs,
+checkpointing, and post-training evaluation. Validation uses greedy CTC
+decode (beam search is reserved for inference) so epochs stay fast.
 
 Usage:
     python main.py train
@@ -18,31 +18,19 @@ import torch
 from torch.nn import CTCLoss
 
 from config import (
-    TRAIN_DIR, TEST_DIR, SYNTHETIC_DIR, IAM_DIR,
+    TRAIN_DIR, TEST_DIR, IAM_DIR,
     BEST_WEIGHTS, FINAL_WEIGHTS, CHECKPOINT_DIR, OUTPUT_DIR,
-    NUM_CLASSES, BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY,
+    NUM_CLASSES, EPOCHS, LR, WEIGHT_DECAY,
     PATIENCE, ACCUMULATION_STEPS, GRAD_CLIP_NORM,
-    BACKBONE_LR_MULT, ONECYCLE_PCT_START, AUGMENT_START_EPOCH,
-    VAL_CER_SAMPLE_LIMIT, FULL_VAL_INTERVAL, PLOT_EVERY_N_EPOCHS,
+    BACKBONE_LR_MULT, ONECYCLE_PCT_START, VAL_CER_SAMPLE_LIMIT,
+    FULL_VAL_INTERVAL, PLOT_EVERY_N_EPOCHS,
 )
 from core.model import ResNetCRNN
 from pipeline.dataset import GNHKDataset, build_weighted_train_set, build_dataloader
 from pipeline.preprocessing import gpu_augment
-from core.decoding import ctc_beam_decode_batch, ctc_greedy_decode_batch, CharLM
+from core.decoding import ctc_greedy_decode_batch          # ← greedy only for training
 from core.metrics import char_error_rate
 from services.evaluation import plot_training_curves, generate_confusion_matrix
-
-
-def _collect_training_texts(dataset):
-    """Extract raw text labels from a (possibly concatenated) dataset."""
-    texts = []
-    if hasattr(dataset, 'cached'):
-        texts = [text for _, _, text in dataset.cached]
-    elif hasattr(dataset, 'datasets'):
-        for ds in dataset.datasets:
-            if hasattr(ds, 'cached'):
-                texts.extend(text for _, _, text in ds.cached)
-    return texts
 
 
 def train():
@@ -59,7 +47,6 @@ def train():
     train_set, sampler = build_weighted_train_set(
         gnhk_dir=TRAIN_DIR,
         iam_dir=IAM_DIR,
-        synthetic_dir=SYNTHETIC_DIR,
     )
     val_set = GNHKDataset(TEST_DIR)
     print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
@@ -87,7 +74,25 @@ def train():
         pct_start=ONECYCLE_PCT_START,
         anneal_strategy="cos",
     )
-    criterion = CTCLoss(blank=0, zero_infinity=True)
+    class SmoothedCTCLoss(torch.nn.Module):
+        def __init__(self, blank=0, smoothing=0.1):
+            super().__init__()
+            self.ctc = CTCLoss(blank=blank, zero_infinity=True)
+            self.smoothing = smoothing
+            self.blank = blank
+
+        def forward(self, log_probs, targets, input_lengths, target_lengths):
+            ctc_loss = self.ctc(log_probs, targets, input_lengths, target_lengths)
+            # Smooth only the non-blank classes — including blank fights CTC's
+            # natural sparsity and silently inflates blank-frame entropy.
+            non_blank = torch.cat(
+                [log_probs[..., :self.blank], log_probs[..., self.blank + 1:]],
+                dim=-1,
+            )
+            smooth_loss = -non_blank.mean()
+            return (1 - self.smoothing) * ctc_loss + self.smoothing * smooth_loss
+
+    criterion = SmoothedCTCLoss(blank=0, smoothing=0.1)
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     best_cer = float("inf")
@@ -102,7 +107,7 @@ def train():
     for epoch in range(EPOCHS):
         epoch_start = time.time()
 
-        # ── Training phase ────────────────────────────────────────
+        # ── Training phase ────────────────────────────────────────────────────
         model.train()
         total_train_loss = 0
 
@@ -110,8 +115,7 @@ def train():
         for batch_idx, (images, labels, label_lengths, _) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            if (epoch + 1) >= AUGMENT_START_EPOCH:
-                images = gpu_augment(images)
+            images = gpu_augment(images)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = model(images)
@@ -135,7 +139,7 @@ def train():
 
             total_train_loss += loss.item() * ACCUMULATION_STEPS
 
-        # ── Validation phase ──────────────────────────────────────
+        # ── Validation phase ──────────────────────────────────────────────────
         model.eval()
         total_val_loss = 0
         correct, total_words = 0, 0
@@ -159,7 +163,9 @@ def train():
 
                 if cer_budget is not None and total_words >= cer_budget:
                     continue
-                
+
+                # Greedy decode — fast, GPU-friendly, sufficient for training signal.
+                # Beam search + LM is applied only at inference time (inference.py).
                 decoded = ctc_greedy_decode_batch(outputs)
 
                 for pred_text, gt_text in zip(decoded, ground_truths):
@@ -196,11 +202,11 @@ def train():
                 best_cer = avg_cer
                 patience_counter = 0
                 torch.save(model.state_dict(), BEST_WEIGHTS)
-                print(f"  \u2713 Best model saved (CER: {best_cer:.2f}%)")
+                print(f"  ✓ Best model saved (CER: {best_cer:.2f}%)")
             else:
                 patience_counter += 1
                 if patience_counter >= PATIENCE:
-                    print(f"  \u2717 Early stopping triggered (no improvement for {PATIENCE} full CER checks)")
+                    print(f"  ✗ Early stopping triggered (no improvement for {PATIENCE} full CER checks)")
                     break
 
         if (epoch + 1) % PLOT_EVERY_N_EPOCHS == 0 or (epoch + 1) == EPOCHS:
@@ -211,14 +217,6 @@ def train():
 
     with open(os.path.join(OUTPUT_DIR, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
-
-    # Build character language model from training labels
-    train_texts = _collect_training_texts(train_set)
-    if train_texts:
-        lm = CharLM()
-        lm.build_from_texts(train_texts)
-        lm.save()
-        print(f"Character LM built from {len(train_texts)} training texts")
 
     # Confusion matrix on best checkpoint
     if os.path.exists(BEST_WEIGHTS):
