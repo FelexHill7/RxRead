@@ -17,18 +17,8 @@ env/
 .env
 *.env
 
-# Model weights / checkpoints
-checkpoints/*.pth
-*.pth
-checkpoints/*.json
-
 # Dataset (too large for git)
 data/
-
-# Generated outputs
-outputs/
-training_curves.png
-training_history.json
 
 # Local scratch / debug
 debug.py
