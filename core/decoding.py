@@ -199,60 +199,107 @@ def ctc_beam_decode_batch(outputs, beam_width=10, lm_weight=0.3, lm=None):
 # ── Character-level language model ────────────────────────────────────────────
 
 class CharLM:
-    """Character bigram language model built from training data labels.
+    """Character trigram language model with bigram backoff (Stupid Backoff).
 
-    Scores text by summing log-probabilities of character bigrams:
-        score("abc") = log P(a|<s>) + log P(b|a) + log P(c|b)
+    Scores text by summing log-probabilities of character trigrams:
+        score("abc") = log P(a|<s><s>) + log P(b|<s>a) + log P(c|ab)
 
-    Provides a soft prior that nudges beam search toward plausible
-    character sequences.
+    When a trigram context is unseen, falls back to the bigram count
+    (multiplied by a fixed backoff penalty) and finally to a uniform prior.
+    Provides a stronger soft prior than pure bigrams: a trigram trained on
+    handwriting transcripts captures common letter triples ("ing", "tion",
+    "the") that bigrams alone can't model.
+
+    Storage format on disk (JSON):
+        {
+            "trigrams": {"ab": {"c": logp, "_default": logp}, ...},
+            "bigrams":  {"a":  {"b": logp, "_default": logp}, ...},
+            "version":  3
+        }
     """
+
+    BACKOFF_PENALTY = math.log(0.4)  # Stupid Backoff α
 
     def __init__(self, path=CHAR_LM_PATH):
         self.path = path
-        self.bigrams = defaultdict(lambda: defaultdict(float))
+        self.trigrams = {}
+        self.bigrams = {}
         self.loaded = False
 
     def build_from_texts(self, texts):
-        """Build bigram counts from a list of training transcriptions."""
-        counts = defaultdict(lambda: defaultdict(int))
-        for text in texts:
-            padded = "^" + text + "$"
-            for a, b in zip(padded[:-1], padded[1:]):
-                counts[a][b] += 1
+        """Build trigram + bigram counts from training transcriptions."""
+        tri_counts = defaultdict(lambda: defaultdict(int))
+        bi_counts = defaultdict(lambda: defaultdict(int))
 
-        vocab_size = len(CHARS) + 2
-        self.bigrams = {}
-        for a, nexts in counts.items():
+        for text in texts:
+            padded = "^^" + text + "$"
+            # Bigrams (skip the leading ^^ pad bigram)
+            for a, b in zip(padded[1:-1], padded[2:]):
+                bi_counts[a][b] += 1
+            # Trigrams: context = previous 2 chars
+            for a, b, c in zip(padded[:-2], padded[1:-1], padded[2:]):
+                tri_counts[a + b][c] += 1
+
+        vocab_size = len(CHARS) + 2  # +1 for ^, +1 for $
+        self.trigrams = {}
+        for ctx, nexts in tri_counts.items():
             total = sum(nexts.values()) + vocab_size
-            self.bigrams[a] = {b: math.log((c + 1) / total) for b, c in nexts.items()}
+            self.trigrams[ctx] = {c: math.log((n + 1) / total) for c, n in nexts.items()}
+            self.trigrams[ctx]["_default"] = math.log(1 / total)
+
+        self.bigrams = {}
+        for a, nexts in bi_counts.items():
+            total = sum(nexts.values()) + vocab_size
+            self.bigrams[a] = {b: math.log((n + 1) / total) for b, n in nexts.items()}
             self.bigrams[a]["_default"] = math.log(1 / total)
 
         self.loaded = True
 
     def save(self):
-        """Save bigram model to disk."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w") as f:
-            json.dump(self.bigrams, f)
+            json.dump(
+                {"version": 3, "trigrams": self.trigrams, "bigrams": self.bigrams},
+                f,
+            )
 
     def load(self):
-        """Load bigram model from disk if it exists."""
-        if os.path.exists(self.path):
-            with open(self.path) as f:
-                self.bigrams = json.load(f)
-            self.loaded = True
-        return self.loaded
+        if not os.path.exists(self.path):
+            return False
+        with open(self.path) as f:
+            data = json.load(f)
+
+        # Backward-compat: an older bigram-only file is a flat dict of
+        # {char: {next_char: logp}}; treat it as the bigram table.
+        if isinstance(data, dict) and "version" in data:
+            self.trigrams = data.get("trigrams", {})
+            self.bigrams = data.get("bigrams", {})
+        else:
+            self.trigrams = {}
+            self.bigrams = data
+            print("[CharLM] Loaded legacy bigram-only file; rebuild for trigram benefit.")
+
+        self.loaded = True
+        return True
+
+    def _bigram_logp(self, a, b):
+        if a in self.bigrams:
+            return self.bigrams[a].get(b, self.bigrams[a].get("_default", -10.0))
+        return -10.0
 
     def score(self, text):
-        """Score a text string using character bigram log-probabilities."""
+        """Score a text string using trigram log-probabilities + bigram backoff."""
         if not self.loaded or not text:
             return 0.0
-        padded = "^" + text + "$"
+        padded = "^^" + text + "$"
         total = 0.0
-        for a, b in zip(padded[:-1], padded[1:]):
-            if a in self.bigrams:
-                total += self.bigrams[a].get(b, self.bigrams[a].get("_default", -10.0))
+        for a, b, c in zip(padded[:-2], padded[1:-1], padded[2:]):
+            ctx = a + b
+            if ctx in self.trigrams:
+                total += self.trigrams[ctx].get(
+                    c, self.trigrams[ctx].get("_default", -10.0)
+                )
             else:
-                total += -10.0
+                # Stupid Backoff to bigram with fixed penalty.
+                total += self.BACKOFF_PENALTY + self._bigram_logp(b, c)
         return total

@@ -92,8 +92,8 @@ def gpu_augment(images):
     tx     = (torch.rand(B, device=device) * 2 - 1) * 0.05
     ty     = (torch.rand(B, device=device) * 2 - 1) * 0.05
     # Horizontal stretch — handwriting has high width variance; this is the
-    # single augmentation that consistently helps OCR. Range 0.85..1.15.
-    sx     = 1.0 + (torch.rand(B, device=device) * 2 - 1) * 0.15
+    # single augmentation that consistently helps OCR. Range 0.8..1.25.
+    sx     = 1.0 + (torch.rand(B, device=device) * 2 - 1) * 0.225
 
     cos_a, sin_a = torch.cos(angles), torch.sin(angles)
 
@@ -111,8 +111,10 @@ def gpu_augment(images):
     )
 
     # ── elastic distortion ──────────────────
-    if torch.rand(1).item() > 0.7:
-        alpha = 3.0
+    # Trigger 50 % of batches (was 30 %) and use larger displacement amplitude;
+    # handwriting has more low-freq deformation than the prior alpha captured.
+    if torch.rand(1).item() > 0.5:
+        alpha = 5.0
         sigma = 4.0
 
         dx = torch.rand(B, 1, H, W, device=device) * 2 - 1

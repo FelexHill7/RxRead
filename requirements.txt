@@ -13,3 +13,10 @@ torchmetrics==1.3.0
 
 flask==3.0.0
 tqdm==4.66.1
+
+# Optional backends (lazy-imported; install only what you use)
+transformers>=4.40        # Microsoft TrOCR backend
+google-genai>=0.3         # Google Gemini Vision backend
+
+# Dev only
+# pytest>=8.0

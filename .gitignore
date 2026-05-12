@@ -13,9 +13,14 @@ env/
 .venv/
 .env/
 
+# Secrets
+.env
+*.env
+
 # Model weights / checkpoints
 checkpoints/*.pth
 *.pth
+checkpoints/*.json
 
 # Dataset (too large for git)
 data/
@@ -44,3 +49,6 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local Claude Code config
+.claude/

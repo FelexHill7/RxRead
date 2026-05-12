@@ -1,26 +1,27 @@
 """
-inference.py — Inference pipeline for handwriting recognition.
+inference.py — In-house CRNN inference + shared line/word segmentation.
 
-Returns structured per-word output: each word carries text, bounding box, and
-confidence so the front-end can colour-code low-confidence predictions.
+Public entry points:
+    predict(image)              — word-level CRNN, segments by word
+    detect_text_lines(image)    — line bounding-box detector, also used
+                                   by TrOCR backend (no recognition)
 
-Key fixes vs prior version:
-- CLAHE before Otsu so shadows / uneven lighting don't break thresholding
-- Word-segmentation thresholds are relative to detected line height instead
-  of absolute pixels (works across different image resolutions)
-- TTA averaging rotates AFTER resize (preprocessing.py) so all branches
-  see the same effective scale
-- LM weight default lowered from 0.7 → 0.4 (a bigram LM at 0.7 overcorrects
-  rare-but-correct tokens like drug names)
+Internals:
+    _preprocess_for_segmentation  binarize + strip non-text noise
+    _detect_lines                 histogram-of-CC-centers line detector
+    _segment_words                projection-based word splitter within a line
 """
 
+import glob
 import os
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 
-from config import NUM_CLASSES, BEST_WEIGHTS, FINAL_WEIGHTS
+from config import (
+    NUM_CLASSES, CHECKPOINT_DIR, SEEDS, seed_weights_path,
+)
 from core.model import ResNetCRNN
 from pipeline.preprocessing import base_transform, tta_transforms
 from core.decoding import (
@@ -29,25 +30,112 @@ from core.decoding import (
     CharLM,
 )
 
-# ── Device & model ────────────────────────────────────────────────────────────
+
+# ── Model loading ────────────────────────────────────────────────────────────
+
+def _discover_checkpoints():
+    """Return every per-seed best-CER checkpoint that exists on disk.
+
+    Multiple checkpoints get auto-ensembled at inference (mean of logits).
+    """
+    paths, seen = [], set()
+    for seed in SEEDS:
+        p = seed_weights_path(seed)
+        if os.path.exists(p) and p not in seen:
+            paths.append(p)
+            seen.add(p)
+    for p in sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "crnn_gnhk_seed*_best.pth"))):
+        if p not in seen:
+            paths.append(p)
+            seen.add(p)
+    return paths
+
+
+def _load_model(weights_path):
+    m = ResNetCRNN(NUM_CLASSES).to(device)
+    state = torch.load(weights_path, map_location=device)
+    m.load_state_dict(state)
+    m.eval()
+    return m
+
+
+# ── Device & ensemble ────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ResNetCRNN(NUM_CLASSES).to(device)
 
-_weights = BEST_WEIGHTS if os.path.exists(BEST_WEIGHTS) else FINAL_WEIGHTS
-
-if os.path.exists(_weights):
-    model.load_state_dict(torch.load(_weights, map_location=device))
-    model.eval()
-    print(f"[predict] Loaded weights: {_weights} on {device}")
+_checkpoints = _discover_checkpoints()
+if _checkpoints:
+    models = [_load_model(p) for p in _checkpoints]
+    print(
+        f"[predict] Loaded {len(models)} checkpoint(s) on {device}: "
+        f"{[os.path.basename(p) for p in _checkpoints]}"
+    )
 else:
-    print("[predict] WARNING: No weights found")
+    models = [ResNetCRNN(NUM_CLASSES).to(device).eval()]
+    print("[predict] WARNING: No weights found — predictions will be random")
 
-# ── Language model ────────────────────────────────────────────────────────────
+
+def _forward_ensemble(x):
+    """Average logits across all loaded checkpoints. Single-model case is a no-op."""
+    with torch.no_grad():
+        if len(models) == 1:
+            return models[0](x)
+        outs = [m(x) for m in models]
+        return torch.stack(outs).mean(0)
+
+
+# ── Language model ───────────────────────────────────────────────────────────
 char_lm = CharLM()
 char_lm.load()
 
 
 # ── WORD SEGMENTATION (resolution-independent) ────────────────────────────────
+
+def _upscale_if_small(pil_image, min_side=800):
+    """Upscale tiny inputs so segmentation has enough pixels.
+
+    Phone screenshots and downscaled uploads can be ~200 px on a side, which
+    starves the morphology kernels and makes line/word thresholds unreliable.
+    """
+    w, h = pil_image.size
+    short = min(w, h)
+    if short >= min_side:
+        return pil_image
+    scale = min_side / short
+    return pil_image.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+
+
+def _strip_non_text_noise(binary):
+    """Remove long horizontal rules (lined paper) and giant blobs (pens,
+    watermarks, photos) that derail projection-based line detection.
+
+    Without this, a single tall non-text object — e.g. a pen lying on the
+    page — pollutes every row's horizontal projection, collapsing the entire
+    image into one detected "line".
+    """
+    h, w = binary.shape
+
+    # 1. Subtract long horizontal lines (paper rules). The kernel is wide
+    #    enough to catch a horizontal rule but too long for any handwritten
+    #    stroke to survive intact.
+    kernel_w = max(w // 4, 30)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+    binary = cv2.subtract(binary, h_lines)
+
+    # 2. Drop connected components too big to plausibly be text. Cursive
+    #    handwriting can chain a whole phrase into one CC (>50 % width is
+    #    common), so the width cutoff has to be very loose. The height
+    #    cutoff catches pens / photo borders / vertical decorations.
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    max_cc_w = int(w * 0.85)
+    max_cc_h = int(h * 0.4)
+    for i in range(1, num_labels):
+        if (stats[i, cv2.CC_STAT_WIDTH] > max_cc_w
+                or stats[i, cv2.CC_STAT_HEIGHT] > max_cc_h):
+            binary[labels == i] = 0
+
+    return binary
+
 
 def _preprocess_for_segmentation(pil_image):
     """Convert to grayscale numpy, normalise contrast, return (gray, binary)."""
@@ -61,29 +149,134 @@ def _preprocess_for_segmentation(pil_image):
         img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
     binary = cv2.medianBlur(binary, 3)
+    binary = _strip_non_text_noise(binary)
     return img, binary
 
 
 def _detect_lines(binary):
-    """Return list of (y0, y1) line spans via horizontal projection."""
-    h = binary.shape[0]
-    h_proj = np.sum(binary, axis=1)
-    if h_proj.max() == 0:
+    """Return list of (y0, y1) line spans via histogram-of-CC-centers.
+
+    Why this over greedy-grouping: greedy grouping breaks when descenders
+    from one line overlap with ascenders of the next line — they bridge in
+    Y-range and merge into one giant group. Histogram-based detection is
+    robust to overlap because each component VOTES at its own y-center.
+    Real lines are dense votes at the same Y; noise is diffuse.
+
+    Pipeline:
+      1. Find all connected components, filter obvious noise
+      2. Each CC contributes 1 vote at its y-center
+      3. Smooth the vote histogram at ~half the typical line height
+      4. Peaks above 30 % of max are line centers
+      5. Assign each CC to its nearest peak; span = min/max of group bboxes
+    """
+    h_img = binary.shape[0]
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+
+    components = []
+    for i in range(1, num_labels):
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+        y = stats[i, cv2.CC_STAT_TOP]
+        if area < 10 or ch < 5 or cw < 3:
+            continue
+        components.append((y, y + ch))
+
+    if not components:
         return []
 
-    line_thresh = h_proj.max() * 0.15
-    lines = []
-    in_line, start = False, 0
-    for y in range(h):
-        if h_proj[y] > line_thresh and not in_line:
-            start, in_line = y, True
-        elif h_proj[y] <= line_thresh and in_line:
-            if y - start > 10:
-                lines.append((start, y))
-            in_line = False
-    if in_line:
-        lines.append((start, h))
-    return lines
+    cc_heights = sorted(c[1] - c[0] for c in components)
+    # 75th-percentile CC height ≈ line height (capitals/descenders span
+    # most of a line; the median is dragged down by lowercase letters).
+    typical_h = max(cc_heights[(3 * len(cc_heights)) // 4], 15)
+
+    # Build vote histogram of y-centers
+    hist = np.zeros(h_img + 1, dtype=np.float32)
+    for c in components:
+        hist[int((c[0] + c[1]) / 2)] += 1
+
+    smooth_window = max(int(typical_h * 0.4), 5)
+    smooth_kernel = np.ones(smooth_window) / smooth_window
+    hist_smooth = np.convolve(hist, smooth_kernel, mode="same")
+
+    if hist_smooth.max() == 0:
+        return []
+
+    # Find local maxima then NMS. min_separation has to be roughly the
+    # actual LINE SPACING, not character height. Two-pass approach:
+    # (1) find candidates with loose NMS using typical_h as initial guess,
+    # (2) estimate true line spacing as median gap between candidates and
+    #     re-NMS with that. This adapts to whatever line spacing the image
+    #     actually has without hard-coding it.
+    threshold = hist_smooth.max() * 0.25
+
+    candidates = []
+    for y in range(1, len(hist_smooth) - 1):
+        v = hist_smooth[y]
+        if v >= threshold and v > hist_smooth[y - 1] and v >= hist_smooth[y + 1]:
+            candidates.append((y, v))
+
+    if not candidates:
+        return []
+
+    def _nms(cands, sep):
+        cands.sort(key=lambda c: -c[1])
+        kept = []
+        for y, h in cands:
+            if all(abs(y - s) >= sep for s, _ in kept):
+                kept.append((y, h))
+        return sorted(kept)
+
+    # First pass: NMS at typical_h to deduplicate within-letter jitter
+    pass1 = _nms(list(candidates), max(int(typical_h * 0.6), 20))
+    if len(pass1) < 2:
+        peaks = [y for y, _ in pass1]
+    else:
+        # Estimate line spacing from gaps between first-pass peaks. Gaps
+        # are bimodal: small gaps = within-line jitter, large gaps = real
+        # inter-line spacing. Use p75 to land on the larger cluster.
+        gaps = sorted(pass1[i + 1][0] - pass1[i][0] for i in range(len(pass1) - 1))
+        p75_gap = gaps[(3 * len(gaps)) // 4]
+        line_spacing = max(p75_gap, typical_h * 1.2)
+        final = _nms(list(candidates), int(line_spacing * 0.7))
+        peaks = [y for y, _ in final]
+
+    if not peaks:
+        return []
+
+    # Assign each CC to its nearest peak by y-center
+    groups = [[] for _ in peaks]
+    for c in components:
+        c_center = (c[0] + c[1]) / 2
+        best_idx = min(range(len(peaks)), key=lambda i: abs(peaks[i] - c_center))
+        groups[best_idx].append(c)
+
+    # Filter sparse groups: a real line of handwriting has many CCs (one
+    # per letter); a decoration / icon / artifact typically has very few.
+    # Drop any group with < 25 % of the average CC count.
+    non_empty = [g for g in groups if g]
+    if not non_empty:
+        return []
+    avg_cc_count = sum(len(g) for g in non_empty) / len(non_empty)
+    min_cc_count = max(int(avg_cc_count * 0.25), 3)
+
+    spans = []
+    for group in non_empty:
+        if len(group) < min_cc_count:
+            continue
+        y0 = min(c[0] for c in group)
+        y1 = max(c[1] for c in group)
+        if (y1 - y0) >= 15:
+            spans.append((y0, y1))
+
+    return spans
+
+
+def detect_text_lines(pil_image):
+    """Return list of (y0, y1) text-line spans for an image using the
+    internal CC-based detector."""
+    _, binary = _preprocess_for_segmentation(pil_image)
+    return _detect_lines(binary)
 
 
 def _segment_words(pil_image):
@@ -97,6 +290,7 @@ def _segment_words(pil_image):
     Returns:
         list of (PIL crop, (x0, y0, x1, y1)) — bbox in source-image coords.
     """
+    pil_image = _upscale_if_small(pil_image)
     _, binary = _preprocess_for_segmentation(pil_image)
     h, w = binary.shape
 
@@ -107,9 +301,11 @@ def _segment_words(pil_image):
     crops = []
     for y0, y1 in lines:
         line_h = max(y1 - y0, 1)
-        # Resolution-independent thresholds:
-        word_gap_px = max(int(line_h * 0.6), 6)
-        min_word_w  = max(int(line_h * 0.3), 4)
+        # Resolution-independent thresholds. word_gap_px must stay BELOW
+        # the typical inter-word gap (~0.5*line_h) — too large and every
+        # word in the line gets merged into one blob.
+        word_gap_px = max(int(line_h * 0.25), 4)
+        min_word_w  = max(int(line_h * 0.15), 3)
 
         row = binary[y0:y1, :]
         v_proj = np.sum(row, axis=0)
@@ -172,13 +368,11 @@ def _predict_single(pil_image, use_beam=True, beam_width=15,
         outs = []
         for t in tta_transforms:
             x = t(pil_image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                outs.append(model(x))
+            outs.append(_forward_ensemble(x))
         output = torch.stack(outs).mean(0)
     else:
         x = base_transform(pil_image).unsqueeze(0).to(device)
-        with torch.no_grad():
-            output = model(x)
+        output = _forward_ensemble(x)
 
     output = output[:, 0:1, :]
     return _decode_with_confidence(output, use_beam, beam_width, lm_weight)
@@ -223,3 +417,5 @@ def predict(image, use_beam=True, beam_width=15,
         "confidence": round(float(avg_conf), 3),
         "words": words,
     }
+
+

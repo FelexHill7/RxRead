@@ -26,11 +26,17 @@ def plot_training_curves(history):
     epochs_so_far = range(1, len(history["train_loss"]) + 1)
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    axes[0].plot(epochs_so_far, history["train_loss"], "o-", label="Train Loss")
-    axes[0].plot(epochs_so_far, history["val_loss"],   "o-", label="Val Loss")
+    # Drop epoch 1 from the loss plot — the random-init train loss is ~6x
+    # larger than every subsequent epoch and crushes the y-axis. Accuracy
+    # and CER plots keep epoch 1 since their natural range (0-100%) handles
+    # the starting point fine.
+    loss_epochs = list(epochs_so_far)[1:]
+    if loss_epochs:
+        axes[0].plot(loss_epochs, history["train_loss"][1:], "o-", label="Train Loss")
+        axes[0].plot(loss_epochs, history["val_loss"][1:],   "o-", label="Val Loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("CTC Loss")
-    axes[0].set_title("Training & Validation Loss")
+    axes[0].set_title("Training & Validation Loss (epoch 1 omitted)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 

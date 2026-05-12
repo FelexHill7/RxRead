@@ -131,6 +131,78 @@
 
   #file-input { display: none; }
 
+  /* Model toggle */
+  .mode-toggle {
+    display: flex;
+    gap: 0;
+    margin-bottom: 24px;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .mode-toggle button {
+    flex: 1;
+    padding: 10px 12px;
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--rule);
+    cursor: pointer;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink);
+    opacity: 0.55;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .mode-toggle button:last-child { border-right: none; }
+  .mode-toggle button:hover { opacity: 0.85; }
+  .mode-toggle button.active {
+    background: var(--ink);
+    color: var(--paper);
+    opacity: 1;
+  }
+  .mode-hint {
+    font-size: 0.65rem;
+    opacity: 0.45;
+    text-align: center;
+    margin: -16px 0 16px 0;
+    line-height: 1.5;
+  }
+
+  .drug-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.7rem;
+    margin-bottom: 24px;
+    padding: 10px 14px;
+    border: 1px dashed var(--rule);
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+    flex-wrap: wrap;
+  }
+  .drug-toggle input { cursor: pointer; }
+  .drug-toggle span:first-of-type {
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .drug-toggle-hint {
+    opacity: 0.5;
+    font-size: 0.65rem;
+    flex-basis: 100%;
+    margin-left: 22px;
+    line-height: 1.5;
+  }
+
+  /* Per-line block (for lines/trocr modes) */
+  .result-line {
+    display: block;
+    margin-bottom: 0.4em;
+  }
+
   /* Preview */
   #preview-wrap {
     display: none;
@@ -307,6 +379,23 @@
     <p class="subtitle">Doctor Handwriting Recognition</p>
   </header>
 
+  <!-- Model toggle -->
+  <div class="mode-toggle" id="mode-toggle">
+    <button data-mode="words">CRNN · Words</button>
+    <button data-mode="trocr">TrOCR · Lines</button>
+    <button data-mode="trocr-whole">TrOCR · Page</button>
+    <button data-mode="gemini" class="active">Gemini Vision</button>
+  </div>
+  <p class="mode-hint" id="mode-hint">
+    Google Gemini vision — best accuracy on diverse handwriting, free tier (15 RPM, 1M tokens/day), needs GEMINI_API_KEY env var
+  </p>
+
+  <label class="drug-toggle">
+    <input type="checkbox" id="drug-bias-checkbox" checked>
+    <span>Prescription mode</span>
+    <span class="drug-toggle-hint">post-process predictions toward drug names (Atorvastatin, Metformin, etc.)</span>
+  </label>
+
   <!-- Drop zone -->
   <div class="drop-zone" id="drop-zone">
     <div class="drop-icon">📋</div>
@@ -392,10 +481,40 @@
     }).join('');
   }
 
+  function renderLines(lines) {
+    if (!lines || !lines.length) return '(no text detected)';
+    return lines.map(l => {
+      const cls = confidenceClass(l.confidence);
+      const pct = (l.confidence * 100).toFixed(0);
+      return `<span class="result-line word ${cls}" title="confidence: ${pct}%">${escapeHTML(l.text)}</span>`;
+    }).join('');
+  }
+
+  // Mode toggle
+  const modeButtons = document.querySelectorAll('#mode-toggle button');
+  const modeHint    = document.getElementById('mode-hint');
+  const MODE_HINTS = {
+    words: 'Word-level CRNN — fastest, brittle on touching letters',
+    trocr: 'TrOCR per-line: segments image into lines first, then runs TrOCR on each',
+    'trocr-whole': 'TrOCR whole-image: skips our segmenter, lets TrOCR see the full page (works only on small / single-line images — TrOCR resizes input to ~384px)',
+    gemini: 'Google Gemini vision — best accuracy on diverse handwriting, free tier (15 RPM, 1M tokens/day), needs GEMINI_API_KEY env var',
+  };
+  let selectedMode = 'gemini';
+  modeButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      modeButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedMode = btn.dataset.mode;
+      modeHint.textContent = MODE_HINTS[selectedMode];
+    });
+  });
+
   let selectedFile = null;
 
-  browseBtn.addEventListener('click', () => fileInput.click());
-  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('click', e => {
+    if (e.target === fileInput) return;
+    fileInput.click();
+  });
 
   fileInput.addEventListener('change', e => {
     if (e.target.files[0]) loadFile(e.target.files[0]);
@@ -431,6 +550,9 @@
 
     const formData = new FormData();
     formData.append('image', selectedFile);
+    formData.append('mode', selectedMode);
+    const drugBias = document.getElementById('drug-bias-checkbox').checked;
+    if (drugBias) formData.append('drug_bias', 'true');
 
     try {
       const res  = await fetch('/predict', { method: 'POST', body: formData });
@@ -443,7 +565,10 @@
         confWrap.style.display = 'none';
         wordLegend.style.display = 'none';
       } else {
-        if (data.words && data.words.length) {
+        if (data.lines && data.lines.length) {
+          resultText.innerHTML = renderLines(data.lines);
+          wordLegend.style.display = 'flex';
+        } else if (data.words && data.words.length) {
           resultText.innerHTML = renderWords(data.words);
           wordLegend.style.display = 'flex';
         } else {
